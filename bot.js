@@ -1,8 +1,19 @@
 const axios = require('axios');
+const express = require('express');
+const crypto = require('crypto');
 
 // Configurações via variáveis de ambiente
 const API_BASE = process.env.OPENWA_API_URL || 'http://localhost:2785/api';
 const API_KEY = process.env.OPENWA_API_KEY || 'dev-admin-key';
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'webhook-secret-123';
+const PORT = process.env.PORT || 3000;
+const PUBLIC_URL = process.env.RAILWAY_STATIC_URL ? `https://${process.env.RAILWAY_STATIC_URL}` : `http://localhost:${PORT}`;
+
+const app = express();
+
+// Middleware
+app.use(express.json());
+app.use(express.raw({ type: 'application/json' }));
 
 // Menu principal
 const MENU_PRINCIPAL = `🤖 *Menu de Opções*
@@ -68,83 +79,40 @@ Digite *menu* para voltar ao menu principal.`
 let processedMessages = new Set();
 let currentSessionId = null;
 
-// Função para buscar mensagens
-async function buscarMensagens() {
-  if (!currentSessionId) {
-    await encontrarSessaoAtiva();
-    return;
-  }
+// Verificar assinatura do webhook
+function verifyWebhookSignature(payload, signature) {
+  if (!signature || !WEBHOOK_SECRET) return true; // Skip if no secret configured
+  
+  const expected = 'sha256=' + crypto
+    .createHmac('sha256', WEBHOOK_SECRET)
+    .update(JSON.stringify(payload))
+    .digest('hex');
+  
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expected)
+  );
+}
 
-  try {
-    const response = await axios.get(
-      `${API_BASE}/sessions/${currentSessionId}/messages`,
-      {
-        headers: {
-          'X-API-Key': API_KEY
-        },
-        params: {
-          limit: 10
-        }
-      }
-    );
-
-    const messages = response.data.messages || response.data;
+// Processar evento do webhook
+async function processarEvento(event) {
+  if (event.event === 'message.received') {
+    const msg = event.data;
     
-    // Processar apenas mensagens novas recebidas (não enviadas por nós)  
-    for (const msg of messages) {
-      if (
-        !processedMessages.has(msg.id) && 
-        !msg.fromMe && 
-        msg.type === 'text' &&
-        msg.body
-      ) {
-        processedMessages.add(msg.id);
-        await processarMensagem(msg);
-      }
+    // Evitar duplicatas
+    if (processedMessages.has(msg.id)) {
+      return;
     }
-  } catch (error) {
-    if (error.response?.status === 404) {
-      console.log(`⚠️  Sessão "${currentSessionId}" não encontrada. Buscando nova sessão...`);
-      currentSessionId = null;
-    } else if (error.response?.status === 429) {
-      console.log('⚠️  Rate limit atingido, aguardando...');
-    } else {
-      console.error('Erro ao buscar mensagens:', error.response?.data || error.message);
+    processedMessages.add(msg.id);
+    
+    // Processar apenas mensagens de texto não enviadas por nós
+    if (msg.type === 'text' && msg.body && !msg.fromMe) {
+      await processarMensagem(msg);
     }
   }
 }
 
-// Função para encontrar sessão ativa
-async function encontrarSessaoAtiva() {
-  try {
-    const response = await axios.get(
-      `${API_BASE}/sessions`,
-      {
-        headers: {
-          'X-API-Key': API_KEY
-        }
-      }
-    );
-    
-    const sessions = response.data;
-    const activeSessions = sessions.filter(s => s.status === 'ready' || s.status === 'CONNECTED');
-    
-    if (activeSessions.length > 0) {
-      currentSessionId = activeSessions[0].id;
-      console.log(`✅ Sessão ativa encontrada: ${currentSessionId}`);
-      return true;
-    } else {
-      console.log('❌ Nenhuma sessão ativa encontrada');
-      console.log('📋 Sessões disponíveis:', sessions.map(s => `${s.id} (${s.status})`));
-      return false;
-    }
-  } catch (error) {
-    console.error('Erro ao buscar sessões:', error.response?.data || error.message);
-    return false;
-  }
-}
-
-// Função para processar mensagem
+// Processar mensagem
 async function processarMensagem(msg) {
   try {
     const from = msg.from;
@@ -165,18 +133,18 @@ async function processarMensagem(msg) {
     // Enviar resposta
     if (resposta) {
       const chatId = from.includes('@') ? from : `${from}@c.us`;
-      await enviarMensagem(chatId, resposta);
+      await enviarMensagem(msg.sessionId, chatId, resposta);
     }
   } catch (error) {
     console.error('Erro ao processar mensagem:', error);
   }
 }
 
-// Função para enviar mensagem
-async function enviarMensagem(to, text) {
+// Enviar mensagem
+async function enviarMensagem(sessionId, to, text) {
   try {
     const response = await axios.post(
-      `${API_BASE}/sessions/${currentSessionId}/messages/send-text`,
+      `${API_BASE}/sessions/${sessionId}/messages/send-text`,
       { chatId: to, text },
       {
         headers: {
@@ -194,22 +162,113 @@ async function enviarMensagem(to, text) {
   }
 }
 
-// Iniciar bot
+// Rota do webhook
+app.post('/webhook', (req, res) => {
+  try {
+    const signature = req.headers['x-openwa-signature'];
+    
+    // Verificar assinatura
+    if (!verifyWebhookSignature(req.body, signature)) {
+      console.log('❌ Assinatura inválida do webhook');
+      return res.status(401).send('Invalid signature');
+    }
+    
+    // Processar evento
+    processarEvento(req.body).catch(error => {
+      console.error('Erro ao processar evento:', error);
+    });
+    
+    // Responder rapidamente
+    res.status(200).json({ status: 'received' });
+  } catch (error) {
+    console.error('Erro no webhook:', error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+// Rota de health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    webhook_url: `${PUBLIC_URL}/webhook`
+  });
+});
+
+// Rota root
+app.get('/', (req, res) => {
+  res.json({
+    service: 'WhatsApp Menu Bot',
+    status: 'running',
+    webhook_endpoint: '/webhook',
+    health_endpoint: '/health'
+  });
+});
+
+// Registrar webhook nas sessões ativas
+async function registrarWebhooks() {
+  try {
+    const response = await axios.get(`${API_BASE}/sessions`, {
+      headers: { 'X-API-Key': API_KEY }
+    });
+    
+    const sessions = response.data;
+    const activeSessions = sessions.filter(s => s.status === 'ready' || s.status === 'CONNECTED');
+    
+    for (const session of activeSessions) {
+      try {
+        console.log(`📡 Registrando webhook para sessão: ${session.id}`);
+        
+        await axios.post(
+          `${API_BASE}/sessions/${session.id}/webhooks`,
+          {
+            url: `${PUBLIC_URL}/webhook`,
+            events: [
+              'message.received',
+              'session.status'
+            ],
+            secret: WEBHOOK_SECRET,
+            headers: {
+              'X-Bot-Name': 'menu-bot'
+            }
+          },
+          {
+            headers: {
+              'X-API-Key': API_KEY,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        
+        console.log(`✅ Webhook registrado para sessão: ${session.id}`);
+      } catch (error) {
+        if (error.response?.status === 409) {
+          console.log(`ℹ️  Webhook já existe para sessão: ${session.id}`);
+        } else {
+          console.error(`❌ Erro ao registrar webhook para ${session.id}:`, error.response?.data || error.message);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Erro ao buscar sessões:', error.response?.data || error.message);
+  }
+}
+
+// Iniciar servidor
 async function iniciarBot() {
   console.log('🤖 Iniciando WhatsApp Menu Bot...');
   console.log(`🔗 API: ${API_BASE}`);
+  console.log(`🌍 Public URL: ${PUBLIC_URL}`);
+  console.log(`🔐 Webhook Secret: ${WEBHOOK_SECRET ? 'Configurado' : 'Não configurado'}`);
   
-  // Buscar sessão ativa
-  const sessaoEncontrada = await encontrarSessaoAtiva();
-  
-  if (!sessaoEncontrada) {
-    console.log('⚠️  Nenhuma sessão WhatsApp conectada. Aguardando...');
-  }
-  
-  console.log('🚀 Bot iniciado! Aguardando mensagens...');
-  
-  // Polling a cada 15 segundos
-  setInterval(buscarMensagens, 15000);
+  // Iniciar servidor HTTP
+  app.listen(PORT, () => {
+    console.log(`🚀 Servidor rodando na porta ${PORT}`);
+    console.log(`📡 Webhook endpoint: ${PUBLIC_URL}/webhook`);
+    
+    // Registrar webhooks após o servidor iniciar
+    setTimeout(registrarWebhooks, 5000);
+  });
 }
 
 // Tratar encerramento
