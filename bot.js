@@ -267,7 +267,7 @@ async function iniciarBot() {
     console.log(`📡 Webhook endpoint: ${PUBLIC_URL}/webhook`);
     
     // Registrar webhooks após o servidor iniciar
-    setTimeout(registrarWebhooks, 5000);
+    // setTimeout(registrarWebhooks, 5000); // Desabilitado temporariamente
   });
 }
 
