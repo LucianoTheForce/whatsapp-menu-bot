@@ -125,12 +125,12 @@ async function processarEvento(event) {
     }
     processedMessages.add(msg.id);
     
-    // Processar apenas mensagens de texto não enviadas por nós
-    if (msg.type === 'text' && msg.body && !msg.fromMe) {
+    // Processar mensagens de texto ou chat não enviadas por nós
+    if ((msg.type === 'text' || msg.type === 'chat') && msg.body && !msg.fromMe) {
       await processarMensagem(msg);
     } else {
       console.log('⚠️  Mensagem ignorada:', {
-        isText: msg.type === 'text',
+        type: msg.type,
         hasBody: !!msg.body,
         fromMe: msg.fromMe
       });
@@ -158,7 +158,16 @@ async function processarMensagem(msg) {
     
     // Enviar resposta
     if (resposta) {
-      const chatId = from.includes('@') ? from : `${from}@c.us`;
+      // Corrigir formato do chatId
+      let chatId = from;
+      if (!from.includes('@')) {
+        chatId = `${from}@c.us`;
+      } else if (from.includes('@lid')) {
+        // Manter como está para grupos/listas
+        chatId = from;
+      }
+      
+      console.log(`📤 Enviando resposta para: ${chatId}`);
       await enviarMensagem(msg.sessionId, chatId, resposta);
     }
   } catch (error) {
